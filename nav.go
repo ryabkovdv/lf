@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/djherbis/times"
@@ -478,7 +479,6 @@ type nav struct {
 	searchInd       int
 	searchPos       int
 	prevFilter      []string
-	volatilePreview bool
 	previewTimer    *time.Timer
 	previewLoading  bool
 	jumpList        []string
@@ -734,34 +734,58 @@ func (nav *nav) exportFiles() {
 }
 
 func (nav *nav) previewLoop(ui *ui) {
-	var prev string
+	const smallDelay = 50 * time.Millisecond
+	const largeDelay = 500 * time.Millisecond
+
+	timer := time.NewTimer(time.Millisecond)
+	defer timer.Stop()
+
+	var running atomic.Int32
+	schedulePreview := func(path string) {
+		running.Add(1)
+		go func() {
+			defer running.Add(-1)
+			nav.preview(path, ui.wins[len(ui.wins)-1])
+		}()
+	}
+
 	for path := range nav.previewChan {
-		clear := len(path) == 0
+		if len(path) == 0 {
+			continue
+		}
+
+		schedulePreview(path)
+		path = ""
+
+		skipTimerReset := false
 	loop:
 		for {
+			if skipTimerReset {
+				skipTimerReset = false
+			} else if running.Load() <= 0 {
+				timer.Reset(smallDelay)
+			} else {
+				timer.Reset(largeDelay)
+			}
+
+			var ok bool
 			select {
-			case path = <-nav.previewChan:
-				clear = clear || len(path) == 0
-			default:
-				break loop
+			case path, ok = <-nav.previewChan:
+				if !ok {
+					return
+				}
+				if len(path) == 0 {
+					skipTimerReset = true
+				}
+				continue loop
+			case <-timer.C:
+				if len(path) != 0 {
+					schedulePreview(path)
+					path = ""
+				} else {
+					break loop
+				}
 			}
-		}
-		win := ui.wins[len(ui.wins)-1]
-		if clear && len(gOpts.previewer) != 0 && len(gOpts.cleaner) != 0 && nav.volatilePreview {
-			cmd := exec.Command(gOpts.cleaner, prev,
-				strconv.Itoa(win.w),
-				strconv.Itoa(win.h),
-				strconv.Itoa(win.x),
-				strconv.Itoa(win.y),
-				path)
-			if err := cmd.Run(); err != nil {
-				log.Printf("cleaning preview: %s", err)
-			}
-			nav.volatilePreview = false
-		}
-		if len(path) != 0 {
-			nav.preview(path, win)
-			prev = path
 		}
 	}
 }
@@ -811,7 +835,6 @@ func (nav *nav) preview(path string, win *win) {
 				if e, ok := err.(*exec.ExitError); ok {
 					if e.ExitCode() != 0 {
 						reg.volatile = true
-						nav.volatilePreview = true
 					}
 				} else {
 					log.Printf("loading file: %s", err)
